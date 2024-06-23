@@ -3,6 +3,7 @@
 #include <ngx_http.h>
 
 typedef struct {
+    ngx_chain_t *bufs;
     unsigned done:1;
 } ngx_http_read_request_body_ctx_t;
 
@@ -64,6 +65,140 @@ ngx_module_t ngx_http_read_request_body_module = {
     NGX_MODULE_V1_PADDING
 };
 
+ngx_module_t *ngx_modules[] = {
+	&ngx_http_read_request_body_module,
+	NULL
+};
+
+char *ngx_module_names[] = {
+	"ngx_http_read_request_body_module",
+	NULL
+};
+
+char *ngx_module_order[] = {
+	NULL
+};
+
+static size_t
+body_size(ngx_http_request_t *r) {
+    ngx_http_core_loc_conf_t  *clcf;
+
+    if (!r->headers_in.chunked) {
+        return r->headers_in.content_length_n;
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf->client_max_body_size) {
+        return clcf->client_max_body_size;
+    }
+
+    return 1024 * 1024; /* 1 MiB */
+}
+
+static ngx_int_t
+save(ngx_chain_t *bufs, ngx_http_request_t *r) {
+    ngx_http_request_body_t *rb;
+    ngx_int_t                bytes = 0;
+
+    rb = r->request_body;
+    if (rb) {
+        ngx_chain_t *cl;
+        ngx_buf_t   *src, *dst;
+        size_t       n, available;
+
+        dst = bufs->buf;
+        for (cl = rb->busy; cl; cl = cl->next) {
+            src = cl->buf;
+            n = src->last - src->pos;
+            available = dst->end - dst->last;
+            if (n > available) {
+                ngx_buf_t *tmp;
+
+                size_t already = dst->last - dst->pos;
+                size_t required = already + n;
+                size_t size = 2 * (dst->end - dst->start);
+                if (required > size) {
+                    size = required;
+                }
+                tmp = ngx_create_temp_buf(r->pool, size);
+                if (!tmp) {
+                    ngx_log_error(NGX_LOG_CRIT, r->connection->log, NGX_ENOMEM,
+                                  "Oom reallocating request body buffer");
+                    return NGX_ERROR;
+                }
+                memcpy(tmp->pos, dst->pos, already);
+                tmp->last += already;
+                dst = tmp;
+            }
+            memcpy(dst->last, src->pos, n);
+            src->pos += n;
+            dst->last += n;
+
+            bytes += n;
+        }
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "read request "
+                   "body module: %d bytes", bytes);
+
+    return bytes;
+}
+
+static void
+do_read(ngx_http_request_t *r, ngx_http_read_request_body_ctx_t *ctx) {
+    ngx_int_t rc, bytes;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, __FUNCTION__);
+
+    do {
+        rc = ngx_http_read_unbuffered_request_body(r);
+
+        bytes = save(ctx->bufs, r);
+        if (bytes < 0 || rc == NGX_ERROR) {
+            r->read_event_handler = ngx_http_block_reading;
+            ctx->done = 1;
+            r->request_body->bufs = ctx->bufs;
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        if (rc == NGX_OK) {
+            r->read_event_handler = ngx_http_block_reading;
+            ctx->done = 1;
+            r->request_body->bufs = ctx->bufs;
+#if defined(nginx_version) && nginx_version >= 8011
+            r->main->count--;
+#endif
+            ngx_http_core_run_phases(r);
+            return;
+        }
+
+        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            r->read_event_handler = ngx_http_block_reading;
+            ctx->done = 1;
+            r->request_body->bufs = ctx->bufs;
+            ngx_http_finalize_request(r, rc);
+            return;
+        }
+    } while (bytes > 0);
+}
+
+static void
+on_read(ngx_http_request_t *r) {
+    ngx_http_read_request_body_ctx_t *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_read_request_body_module);
+    if (ctx == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "The request context of the ngx_http_read_request_body "
+                      "module is null");
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    do_read(r, ctx);
+}
+
 static void
 ngx_http_read_request_body_post_handler(ngx_http_request_t *r)
 {
@@ -77,15 +212,47 @@ ngx_http_read_request_body_post_handler(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_read_request_body_module);
 
     if (ctx == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "The request context of the ngx_http_read_request_body "
+                      "module is null");
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
     }
 
-#if defined(nginx_version) && nginx_version >= 8011
-    r->main->count--;
-#endif
+    if (r->reading_body) {
+        ngx_buf_t *b;
+        size_t     size;
 
-    if (!ctx->done) {
+        size = body_size(r);
+        b = ngx_create_temp_buf(r->pool, size);
+        if (!b) {
+            ngx_log_error(NGX_LOG_CRIT, r->connection->log, NGX_ENOMEM,
+                          "Oom allocating request body buffer");
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+        ctx->bufs = ngx_alloc_chain_link(r->pool);
+        if (!ctx->bufs) {
+            ngx_log_error(NGX_LOG_CRIT, r->connection->log, NGX_ENOMEM,
+                          "Oom allocating request body buffer chain");
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+        ctx->bufs->next = NULL;
+        ctx->bufs->buf = b;
+
+        if (save(ctx->bufs, r) < 0) {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        r->read_event_handler = on_read;
+        do_read(r, ctx);
+    } else {
         ctx->done = 1;
+#if defined(nginx_version) && nginx_version >= 8011
+        r->main->count--;
+#endif
 
         ngx_http_core_run_phases(r);
     }
@@ -115,20 +282,18 @@ ngx_http_read_request_body_handler(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_read_request_body_module);
 
     if (ctx == NULL) {
-        ctx = ngx_palloc(r->connection->pool, sizeof(ngx_http_read_request_body_ctx_t));
+        ctx = ngx_pcalloc(r->connection->pool, sizeof(ngx_http_read_request_body_ctx_t));
         if (ctx == NULL) {
+            ngx_log_error(NGX_LOG_CRIT, r->connection->log, NGX_ENOMEM,
+                          "Oom allocating ngx_http_read_request_body context");
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
-
-        ctx->done = 0;
 
         ngx_http_set_ctx(r, ctx, ngx_http_read_request_body_module);
     }
 
     if (!ctx->done) {
-        r->request_body_in_single_buf = 1;
-        r->request_body_in_persistent_file = 1;
-        r->request_body_in_clean_file = 1;
+        r->request_body_no_buffering = 1;
 
         rc = ngx_http_read_client_request_body(r, ngx_http_read_request_body_post_handler);
 
